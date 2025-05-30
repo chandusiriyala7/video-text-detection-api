@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Production-Ready Flask API for Video Text Detection
-Supports both file uploads and video URL processing with download capability.
+Production-Ready Flask API for Video Text Detection with Subtitle Placement
+Supports both file uploads and video URL processing with subtitle positioning.
 
 Author: Videograph AI 
-Version: 2.0.0
+Version: 2.1.0
 License: MIT
 """
 
@@ -18,6 +18,7 @@ import requests
 import tempfile
 import shutil
 import uuid
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass, asdict
@@ -86,6 +87,11 @@ class Config:
     # Download config
     DOWNLOAD_TIMEOUT = int(os.environ.get('DOWNLOAD_TIMEOUT', '180'))  # 3 minutes
     MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024  # 100MB
+    
+    # Subtitle config
+    SUBTITLE_MARGIN = 20  # pixels from edges
+    SUBTITLE_HEIGHT = 60  # estimated subtitle height
+    SUBTITLE_WIDTH_RATIO = 0.8  # 80% of video width
 
 @dataclass
 class BoundingBox:
@@ -134,6 +140,10 @@ class BoundingBox:
             right=self.right + padding,
             bottom=self.bottom + padding
         )
+    
+    def overlaps_with(self, other: 'BoundingBox', threshold: float = 0.1) -> bool:
+        """Check if this box overlaps significantly with another"""
+        return self.intersection_over_union(other) > threshold
 
 @dataclass
 class TextDetection:
@@ -149,7 +159,12 @@ class TextDetection:
         return {
             'start_time': self._format_timestamp(self.start_time),
             'end_time': self._format_timestamp(self.end_time),
-            'box': asdict(self.box),
+            'box': {
+                'top': self.box.top,
+                'left': self.box.left,
+                'right': self.box.right,
+                'bottom': self.box.bottom
+            },
             'confidence': round(self.confidence, 3),
             'text_content': self.text_content
         }
@@ -161,6 +176,30 @@ class TextDetection:
         minutes = int((seconds % 3600) // 60)
         secs = seconds % 60
         return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
+@dataclass
+class SubtitlePlacement:
+    """Represents a suggested subtitle placement"""
+    start_time: float
+    end_time: float
+    position: str  # 'middle_center' or 'top_center'
+    box: BoundingBox
+    priority: int  # 1 = highest priority
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for JSON serialization"""
+        return {
+            'start_time': TextDetection._format_timestamp(self.start_time),
+            'end_time': TextDetection._format_timestamp(self.end_time),
+            'position': self.position,
+            'box': {
+                'top': self.box.top,
+                'left': self.box.left,
+                'right': self.box.right,
+                'bottom': self.box.bottom
+            },
+            'priority': self.priority
+        }
 
 class AdvancedPreprocessor:
     """Advanced image preprocessing pipeline for optimal OCR performance"""
@@ -244,6 +283,107 @@ class EasyOCREngine(OCREngine):
             logger.error(f"EasyOCR detection failed: {e}")
             return []
 
+class VideoTitleExtractor:
+    """Extracts video title from URL or file metadata"""
+    
+    @staticmethod
+    def extract_from_url(url: str) -> str:
+        """Extract title from URL"""
+        try:
+            # Try to get title from URL structure
+            parsed = urlparse(url)
+            path = parsed.path
+            
+            # Extract filename without extension
+            filename = os.path.basename(path)
+            if filename:
+                name, _ = os.path.splitext(filename)
+                # Clean up the name
+                title = name.replace('_', ' ').replace('-', ' ')
+                # Capitalize words
+                title = ' '.join(word.capitalize() for word in title.split())
+                return title if title else "Video"
+            
+            return "Video"
+        except Exception:
+            return "Video"
+    
+    @staticmethod
+    def extract_from_file(filepath: str) -> str:
+        """Extract title from file path"""
+        try:
+            filename = os.path.basename(filepath)
+            name, _ = os.path.splitext(filename)
+            # Clean up the name
+            title = name.replace('_', ' ').replace('-', ' ')
+            # Remove UUIDs and timestamps
+            title = re.sub(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', '', title)
+            title = re.sub(r'\d{4}-\d{2}-\d{2}', '', title)
+            title = ' '.join(word.capitalize() for word in title.split() if word)
+            return title if title else "Video"
+        except Exception:
+            return "Video"
+
+class SubtitlePlacer:
+    """Handles subtitle placement logic"""
+    
+    def __init__(self, video_width: int, video_height: int):
+        self.video_width = video_width
+        self.video_height = video_height
+        self.margin = Config.SUBTITLE_MARGIN
+        self.subtitle_height = Config.SUBTITLE_HEIGHT
+        self.subtitle_width = int(video_width * Config.SUBTITLE_WIDTH_RATIO)
+    
+    def get_middle_center_box(self) -> BoundingBox:
+        """Get bounding box for middle center position"""
+        left = (self.video_width - self.subtitle_width) // 2
+        right = left + self.subtitle_width
+        top = (self.video_height - self.subtitle_height) // 2
+        bottom = top + self.subtitle_height
+        
+        return BoundingBox(left, top, right, bottom)
+    
+    def get_top_center_box(self) -> BoundingBox:
+        """Get bounding box for top center position"""
+        left = (self.video_width - self.subtitle_width) // 2
+        right = left + self.subtitle_width
+        top = self.margin
+        bottom = top + self.subtitle_height
+        
+        return BoundingBox(left, top, right, bottom)
+    
+    def suggest_placement(self, detections: List[TextDetection], 
+                         start_time: float, end_time: float) -> SubtitlePlacement:
+        """Suggest best subtitle placement for given time range"""
+        middle_box = self.get_middle_center_box()
+        top_box = self.get_top_center_box()
+        
+        # Check if middle center conflicts with any detections in this time range
+        conflicting_detections = [
+            d for d in detections 
+            if (d.start_time <= end_time and d.end_time >= start_time and
+                d.box.overlaps_with(middle_box))
+        ]
+        
+        if not conflicting_detections:
+            # Middle center is free
+            return SubtitlePlacement(
+                start_time=start_time,
+                end_time=end_time,
+                position='middle_center',
+                box=middle_box,
+                priority=1
+            )
+        else:
+            # Fall back to top center
+            return SubtitlePlacement(
+                start_time=start_time,
+                end_time=end_time,
+                position='top_center',
+                box=top_box,
+                priority=2
+            )
+
 class VideoDownloader:
     """Handles video downloading from URLs with safety checks"""
     
@@ -252,7 +392,7 @@ class VideoDownloader:
         self.max_size = max_size
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'VideoTextDetector/2.0 (Video Processing Service)'
+            'User-Agent': 'VideoTextDetector/2.1 (Video Processing Service)'
         })
     
     def is_valid_video_url(self, url: str) -> bool:
@@ -495,12 +635,128 @@ class ProductionVideoTextDetector:
                 "detections_found": len(all_detections)
             },
             "detections": [detection.to_dict() for detection in all_detections],
-            "merged_blocked_region": asdict(merged_region) if merged_region else None
+            "merged_blocked_region": {
+                'top': merged_region.top,
+                'left': merged_region.left,
+                'right': merged_region.right,
+                'bottom': merged_region.bottom
+            } if merged_region else None
         }
         
         processing_time = time.time() - start_time
         logger.info(f"Processing completed in {processing_time:.2f}s")
         logger.info(f"Found {len(all_detections)} text regions")
+        
+        return results
+    
+    def process_video_with_subtitles(self, video_path: str, video_url: str = None) -> Dict:
+        """Process video with subtitle placement suggestions"""
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        logger.info(f"Processing video with subtitles: {video_path}")
+        start_time = time.time()
+        
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise IOError(f"Cannot open video file: {video_path}")
+        
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration = total_frames / fps if fps > 0 else 0
+        
+        logger.info(f"Video properties: {width}x{height}, {fps:.2f} FPS, {duration:.2f}s")
+        
+        # Check duration limit
+        if duration > Config.MAX_VIDEO_DURATION:
+            cap.release()
+            raise ValueError(f"Video too long: {duration:.2f}s (max: {Config.MAX_VIDEO_DURATION}s)")
+        
+        # Extract title
+        if video_url:
+            title = VideoTitleExtractor.extract_from_url(video_url)
+        else:
+            title = VideoTitleExtractor.extract_from_file(str(video_path))
+        
+        all_detections = []
+        frame_count = 0
+        processed_frames = 0
+        
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if frame_count % self.frame_skip != 0:
+                    frame_count += 1
+                    continue
+                
+                timestamp = frame_count / fps if fps > 0 else 0
+                detections = self._process_frame(frame, timestamp)
+                
+                for bbox, confidence, text in detections:
+                    detection = TextDetection(
+                        start_time=timestamp,
+                        end_time=timestamp + (self.frame_skip / fps if fps > 0 else 1),
+                        box=bbox,
+                        confidence=confidence,
+                        text_content=text
+                    )
+                    all_detections.append(detection)
+                
+                processed_frames += 1
+                frame_count += 1
+                
+                if processed_frames % 10 == 0:
+                    progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                    logger.info(f"Progress: {progress:.1f}%")
+        
+        finally:
+            cap.release()
+        
+        # Generate subtitle placements
+        subtitle_placer = SubtitlePlacer(width, height)
+        subtitle_placements = []
+        
+        # Create subtitle placement suggestions every 5 seconds
+        time_interval = 5.0  # seconds
+        current_time = 0.0
+        
+        while current_time < duration:
+            end_time = min(current_time + time_interval, duration)
+            placement = subtitle_placer.suggest_placement(all_detections, current_time, end_time)
+            subtitle_placements.append(placement)
+            current_time = end_time
+        
+        results = {
+            "title": title,
+            "video_dimensions": {
+                "width": width,
+                "height": height
+            },
+            "video_properties": {
+                "fps": fps,
+                "duration": duration,
+                "total_frames": total_frames
+            },
+            "processing_stats": {
+                "processed_frames": processed_frames,
+                "frame_skip": self.frame_skip,
+                "processing_time": time.time() - start_time,
+                "detections_found": len(all_detections)
+            },
+            "text_detections": [detection.to_dict() for detection in all_detections],
+            "subtitle_placements": [placement.to_dict() for placement in subtitle_placements]
+        }
+        
+        processing_time = time.time() - start_time
+        logger.info(f"Processing completed in {processing_time:.2f}s")
+        logger.info(f"Found {len(all_detections)} text regions and {len(subtitle_placements)} subtitle placements")
         
         return results
 
@@ -534,14 +790,15 @@ def allowed_file(filename):
 def home():
     """Home endpoint with API information"""
     return jsonify({
-        'name': 'Video Text Detection API',
-        'version': '2.0.0',
+        'name': 'Video Text Detection API with Subtitle Placement',
+        'version': '2.1.0',
         'status': 'running',
         'endpoints': {
             '/': 'API information',
             '/health': 'Health check',
             '/process-url': 'Process video from URL (POST)',
             '/process-file': 'Process uploaded video (POST)',
+            '/process-subtitles': 'Process video with subtitle placement (POST)',
             '/api-info': 'Detailed API information'
         }
     })
@@ -552,10 +809,106 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': time.time(),
-        'version': '2.0.0',
+        'version': '2.1.0',
         'easyocr_available': EASYOCR_AVAILABLE,
         'torch_available': TORCH_AVAILABLE
     })
+
+@app.route('/process-subtitles', methods=['POST'])
+def process_video_with_subtitles():
+    """Process video from URL with subtitle placement suggestions"""
+    try:
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({
+                'error': 'Video URL is required',
+                'message': 'Please provide a video URL in the request body'
+            }), 400
+        
+        video_url = data['url'].strip()
+        
+        # Validate URL format
+        if not video_url.startswith(('http://', 'https://')):
+            return jsonify({
+                'error': 'Invalid URL format',
+                'message': 'URL must start with http:// or https://'
+            }), 400
+        
+        # Generate unique task ID
+        task_id = str(uuid.uuid4())
+        
+        # Validate video URL
+        if not downloader.is_valid_video_url(video_url):
+            return jsonify({
+                'error': 'Invalid video URL',
+                'message': 'URL does not appear to be a valid video file. Supported formats: mp4, avi, mov, mkv, webm'
+            }), 400
+        
+        # Download video
+        temp_video_path = os.path.join(Config.TEMP_FOLDER, f"{task_id}.mp4")
+        
+        try:
+            logger.info(f"Starting video download for task {task_id}")
+            downloader.download_video(video_url, temp_video_path)
+            logger.info(f"Video download completed for task {task_id}")
+        except ValueError as e:
+            return jsonify({
+                'error': 'Video validation failed',
+                'message': str(e)
+            }), 400
+        except Exception as e:
+            return jsonify({
+                'error': 'Download failed',
+                'message': str(e)
+            }), 400
+        
+        # Process video with subtitle placement
+        try:
+            logger.info(f"Starting video processing for task {task_id}")
+            detector_instance = get_detector()
+            results = detector_instance.process_video_with_subtitles(temp_video_path, video_url)
+            
+            # Clean up temp file
+            if os.path.exists(temp_video_path):
+                os.remove(temp_video_path)
+            
+            logger.info(f"Video processing completed for task {task_id}")
+            
+            # Add task metadata
+            response_data = {
+                'task_id': task_id,
+                'status': 'completed',
+                'timestamp': time.time(),
+                'source_url': video_url,
+                **results
+            }
+            
+            return jsonify(response_data)
+            
+        except ValueError as e:
+            # Clean up on validation error
+            if os.path.exists(temp_video_path):
+                os.remove(temp_video_path)
+            return jsonify({
+                'error': 'Video processing validation failed',
+                'message': str(e)
+            }), 400
+        except Exception as e:
+            # Clean up on processing error
+            if os.path.exists(temp_video_path):
+                os.remove(temp_video_path)
+            logger.error(f"Processing failed for task {task_id}: {e}")
+            return jsonify({
+                'error': 'Video processing failed',
+                'message': str(e)
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Process subtitles error: {e}")
+        return jsonify({
+            'error': 'Internal server error',
+            'message': 'An unexpected error occurred during processing'
+        }), 500
 
 @app.route('/process-url', methods=['POST'])
 def process_video_url():
@@ -658,23 +1011,29 @@ def process_video_file():
 def api_info():
     """Get detailed API information and usage"""
     return jsonify({
-        'name': 'Video Text Detection API',
-        'version': '2.0.0',
-        'description': 'API for detecting text in videos using OCR technology',
+        'name': 'Video Text Detection API with Subtitle Placement',
+        'version': '2.1.0',
+        'description': 'API for detecting text in videos and suggesting subtitle placements using OCR technology',
         'endpoints': {
             '/': 'API information',
             '/health': 'Health check',
             '/process-url': {
                 'method': 'POST',
-                'description': 'Process video from URL',
+                'description': 'Process video from URL (legacy endpoint)',
                 'body': {'url': 'string - Video URL'},
                 'response': 'JSON with detection results'
             },
             '/process-file': {
                 'method': 'POST',
-                'description': 'Process uploaded video file',
+                'description': 'Process uploaded video file (legacy endpoint)',
                 'body': 'Form data with video file',
                 'response': 'JSON with detection results'
+            },
+            '/process-subtitles': {
+                'method': 'POST',
+                'description': 'Process video from URL with subtitle placement suggestions',
+                'body': {'url': 'string - Video URL'},
+                'response': 'JSON with text detections and subtitle placement suggestions'
             },
             '/api-info': 'Detailed API information'
         },
@@ -687,19 +1046,42 @@ def api_info():
         'features': [
             'Text detection in video frames',
             'OCR with confidence scores',
-            'Bounding box coordinates',
+            'Bounding box coordinates (top, left, right, bottom format)',
             'Timestamp information',
-            'Focus region processing'
-        ]
+            'Focus region processing (bottom 30%)',
+            'Video title extraction',
+            'Subtitle placement suggestions',
+            'Priority-based subtitle positioning',
+            'Professional subtitle workflow integration'
+        ],
+        'subtitle_placement': {
+            'positions': ['middle_center', 'top_center'],
+            'priority': 'middle_center preferred, top_center as fallback',
+            'detection_avoidance': 'Automatically avoids detected text regions',
+            'time_segments': 'Suggestions provided in 5-second intervals'
+        }
     })
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
+    return jsonify({
+        'error': 'Endpoint not found',
+        'message': 'The requested endpoint does not exist. Check /api-info for available endpoints.'
+    }), 404
+
+@app.errorhandler(413)
+def payload_too_large(error):
+    return jsonify({
+        'error': 'File too large',
+        'message': f'Maximum file size is {Config.MAX_CONTENT_LENGTH // (1024*1024)}MB'
+    }), 413
 
 @app.errorhandler(500)
 def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
+    return jsonify({
+        'error': 'Internal server error',
+        'message': 'An unexpected error occurred. Please try again later.'
+    }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
